@@ -2,9 +2,10 @@
 
 <img src="assets/preview-optimized.jpg" height="300" /> <img src="assets/preview2-optimized.jpg" height="300" />
 
-A ring of LEDs showing the light of the past day. Each new measurement enters at
-the front and pushes the rest along, so the whole day is there at once — bright
-to dim, cool to warm.
+I was looking for a way to capture a day in light. This is a ring of LEDs
+showing the light of the past day — each new measurement enters at the front and
+pushes the rest along, so the whole day is there at once, bright to dim, cool to
+warm.
 
 ## Hardware
 
