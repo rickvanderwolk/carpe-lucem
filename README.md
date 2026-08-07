@@ -1,6 +1,6 @@
 # Carpe Lucem
 
-<img src="assets/preview-optimized.jpg" width="49%" /> <img src="assets/preview2-optimized.jpg" width="49%" />
+<img src="assets/preview-optimized.jpg" height="300" /> <img src="assets/preview2-optimized.jpg" height="300" />
 
 A ring of LEDs showing the light it has measured over the last 24 hours. Each
 new measurement enters at the front and pushes the rest along, so you see the
