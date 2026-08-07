@@ -26,5 +26,4 @@ those two), `SATURATION_PCT` how far colours are stretched.
 
 ## Status
 
-Prototype, shared as is. It could use a proper case, and the sensors in a
-separate module so the ring can hang anywhere.
+Prototype, shared as is. It could use a proper case, with the sensors moved into a separate module so the ring can hang anywhere. I'm also not entirely convinced that a ring is the ultimate form factor; a horizontal bar might work better. I'm looking for an elegant way to do that, although I may never get around to it.
