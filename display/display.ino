@@ -2,6 +2,8 @@
 // Ontvangt metingen van de sensormodule via ESP-NOW, middelt ze en zet elke
 // LED_INTERVAL_MS een nieuwe LED vooraan op de strip; de rest schuift een plek op.
 
+#include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_now.h>
 #include <Adafruit_NeoPixel.h>
 
