@@ -13,12 +13,18 @@
 // Moet gelijk zijn aan sensor/sensor.ino.
 #define ESPNOW_CHANNEL 1
 
+// Lange-afstandsmodus van ESP-NOW: langzamer zenden, maar twee tot vier keer
+// meer bereik. Beide modules moeten hierin hetzelfde staan, anders horen ze
+// elkaar niet meer.
+const bool LONG_RANGE = true;
+
 // Hoe lang doet de strip over één volledige cyclus (alle LEDs vol).
-//   60000UL * 5           ->  5 min   (demo: elke 5 s een LED)
+//   60000UL * 5           ->  5 min   (elke 5 s een LED)
+//   60000UL * 15          -> 15 min   (elke 15 s een LED)
 //   60000UL * 60          ->  1 uur
 //   60000UL * 60 * 24     -> 24 uur
 //   60000UL * 60 * 24 * 7 ->  1 week
-const unsigned long TOTAL_TIME_MS = 60000UL * 5;
+const unsigned long TOTAL_TIME_MS = 60000UL * 15;
 
 const unsigned long LED_INTERVAL_MS = TOTAL_TIME_MS / LED_COUNT;
 
@@ -26,7 +32,22 @@ const unsigned long LED_INTERVAL_MS = TOTAL_TIME_MS / LED_COUNT;
 // false: elke LED is de laatste meting (momentopname).
 const bool AVERAGE = true;
 
+// Hoe lux wordt omgerekend naar helderheid.
+//   BRIGHT_LOG    : logaritmisch, zoals je ogen licht ervaren
+//   BRIGHT_POWER  : tussenweg tussen logaritmisch en recht evenredig
+//   BRIGHT_LINEAR : lux / 4, zoals de eerste versie
+enum BrightnessMode { BRIGHT_LOG, BRIGHT_POWER, BRIGHT_LINEAR };
+const BrightnessMode BRIGHTNESS_MODE = BRIGHT_LOG;
+
+const float LUX_MIN = 1.0;        // hieronder blijft de LED uit
+const float LUX_MAX = 50000.0;    // hierboven staat hij vol
+const float POWER_GAMMA = 2.5;    // alleen voor BRIGHT_POWER
+
 const uint8_t SATURATION_PCT = 80;
+
+// Print bij elke nieuwe LED de eerste acht LEDs van de strip, om te controleren
+// dat de geschiedenis opschuift.
+const bool DEBUG_PIXELS = false;
 
 // Na zoveel stilte een melding in de seriële monitor.
 const unsigned long SILENCE_WARN_MS = 15000;
@@ -57,6 +78,15 @@ uint32_t lastSeq = 0;
 unsigned long lastReceived = 0;
 unsigned long lastWarned = 0;
 
+// Cijfers over de verbinding, om te zien hoe ver de modules uit elkaar kunnen.
+// Alles sinds het opstarten, en alles sinds de vorige LED.
+uint32_t statReceived = 0;   // metingen die aankwamen
+uint32_t statMissed = 0;     // metingen waarvan geen enkele kopie aankwam
+uint32_t statCopies = 0;     // extra kopieën van metingen die er al waren
+uint32_t ledReceived = 0;
+uint32_t ledMissed = 0;
+uint32_t ledCopies = 0;
+
 // Opgeteld licht sinds de vorige LED.
 double sumLux = 0;
 double sumCh[10] = {0};
@@ -72,6 +102,15 @@ uint8_t clamp255(float v) {
   return (uint8_t)v;
 }
 
+// Helderheid van 0 tot 1 voor een gemeten lux-waarde.
+float brightnessFor(float lux) {
+  if (lux <= LUX_MIN) return 0;
+  if (BRIGHTNESS_MODE == BRIGHT_LINEAR) return min(lux / 4.0f, 255.0f) / 255.0f;
+  if (lux >= LUX_MAX) return 1;
+  if (BRIGHTNESS_MODE == BRIGHT_POWER) return powf(lux / LUX_MAX, 1.0f / POWER_GAMMA);
+  return logf(lux / LUX_MIN) / logf(LUX_MAX / LUX_MIN);
+}
+
 // Kleur uit de verhouding tussen de kanalen, helderheid uit lux.
 void computeColor(const Light &m, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
   float rawR = m.ch[6] + m.ch[7] + m.ch[5] / 2.0f;   // 630 + 680 + ½ 590
@@ -85,7 +124,7 @@ void computeColor(const Light &m, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
   float range = maxRGB - stretchMin;
   if (range <= 0) range = 1;
 
-  float brightness = clamp255(m.lux / 4.0f) / 255.0f;
+  float brightness = brightnessFor(m.lux);
   *outR = clamp255((rawR - stretchMin) * 255.0f / range * brightness);
   *outG = clamp255((rawG - stretchMin) * 255.0f / range * brightness);
   *outB = clamp255((rawB - stretchMin) * 255.0f / range * brightness);
@@ -132,6 +171,7 @@ void initRadio() {
   inbox = xQueueCreate(4, sizeof(Measurement));
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (LONG_RANGE) esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW start mislukt");
     return;
@@ -140,13 +180,35 @@ void initRadio() {
   Serial.println("ESP-NOW OK, wacht op sensor");
 }
 
+const char *resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "stroom aan";
+    case ESP_RST_SW:       return "software (bijv. na flashen)";
+    case ESP_RST_PANIC:    return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout: spanning zakte te ver weg";
+    default:               return "anders";
+  }
+}
+
 void collect(const Measurement &m) {
-  if (receivedAny && m.seq <= lastSeq) {
+  if (receivedAny && m.seq == lastSeq) {
+    statCopies++;   // kopie van een meting die we al hebben
+    ledCopies++;
+    return;
+  }
+  if (receivedAny && m.seq < lastSeq) {
     Serial.println("sensor opnieuw opgestart");
+    statReceived = statMissed = statCopies = 0;
   } else if (receivedAny && m.seq > lastSeq + 1) {
-    Serial.printf("%lu meting(en) gemist\n", (unsigned long)(m.seq - lastSeq - 1));
+    statMissed += m.seq - lastSeq - 1;
+    ledMissed += m.seq - lastSeq - 1;
   }
   receivedAny = true;
+  statReceived++;
+  ledReceived++;
   lastSeq = m.seq;
 
   latest.lux = m.lux;
@@ -171,8 +233,25 @@ void showNextLed() {
   strip.setPixelColor(0, strip.Color(r, g, b));
   strip.show();
 
-  Serial.printf("LED uit %lu meting(en)\tlux %.1f\tRGB %u,%u,%u\n",
-                (unsigned long)sampleCount, l.lux, r, g, b);
+  uint32_t ledTotal = ledReceived + ledMissed;
+  uint32_t total = statReceived + statMissed;
+  Serial.printf("LED uit %lu meting(en)\tlux %.1f\tRGB %u,%u,%u"
+                "\t| nu: gemist %lu van %lu, kopieën %.1f"
+                "\t| totaal: gemist %.0f%% van %lu\n",
+                (unsigned long)sampleCount, l.lux, r, g, b,
+                (unsigned long)ledMissed, (unsigned long)ledTotal,
+                ledReceived ? 1.0 + (double)ledCopies / ledReceived : 0.0,
+                total ? 100.0 * statMissed / total : 0.0, (unsigned long)total);
+  ledReceived = ledMissed = ledCopies = 0;
+
+  if (DEBUG_PIXELS) {
+    Serial.print("   strip:");
+    for (uint8_t i = 0; i < 8 && i < LED_COUNT; i++) {
+      uint32_t c = strip.getPixelColor(i);
+      Serial.printf(" %u,%u,%u", (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);
+    }
+    Serial.println();
+  }
 
   sumLux = 0;
   for (uint8_t i = 0; i < 10; i++) sumCh[i] = 0;
@@ -190,6 +269,7 @@ void setup() {
   bootAnimation();
 
   initRadio();
+  Serial.printf("opgestart door: %s (%d)\n", resetReason(), esp_reset_reason());
 }
 
 void loop() {

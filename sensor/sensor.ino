@@ -9,21 +9,29 @@
 #include <Adafruit_VEML7700.h>
 #include <Adafruit_AS7341.h>
 
-// I2C-pinnen. Op de C3 niet 8/9: daar zit het blauwe ledje op en het zijn opstartpinnen.
-#if CONFIG_IDF_TARGET_ESP32C3
+// I2C-pinnen. Dezelfde op de C3 en de S3, zodat je van bordje kunt wisselen
+// zonder te herbedraden. Op de C3 niet 8/9: daar zit het blauwe ledje op en
+// het zijn bovendien opstartpinnen.
 #define SDA_PIN 6
 #define SCL_PIN 7
-#else
-#define SDA_PIN 8
-#define SCL_PIN 9
-#endif
 
 // Moet gelijk zijn aan display/display.ino.
 #define ESPNOW_CHANNEL 1
 
+// Lange-afstandsmodus van ESP-NOW: langzamer zenden, maar twee tot vier keer
+// meer bereik. Beide modules moeten hierin hetzelfde staan, anders horen ze
+// elkaar niet meer.
+const bool LONG_RANGE = true;
+
 // Zo vaak meten en versturen. Het display middelt alle metingen per LED.
 // Sneller dan ~1 s kan niet: één meting kost de AS7341 al ~0,6 s.
-const unsigned long INTERVAL_MS = 1000;
+const unsigned long INTERVAL_MS = 5000;
+
+// Elke meting een paar keer versturen. Een broadcast wordt niet bevestigd, dus
+// dit is de manier om afstand en een zwakke antenne op te vangen. Het display
+// herkent kopieën aan het seq-nummer en gooit ze weg.
+const uint8_t SEND_COPIES = 3;
+const uint8_t SEND_GAP_MS = 20;
 
 // AS7341 kiest zelf zijn gain: omlaag als hij bijna verzadigt, omhoog als hij
 // weinig telt. ATIME/ASTEP blijven vast, dus de maximale telling is 65535.
@@ -91,6 +99,7 @@ void initSensors() {
 void initRadio() {
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (LONG_RANGE) esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW start mislukt");
     return;
@@ -156,8 +165,11 @@ void measureAndSend() {
     m.ch[i] = (uint32_t)r[order[i]] << (AS7341_GAIN_512X - gain);
   }
 
-  bool sent = radioOk &&
-              esp_now_send(BROADCAST_MAC, (const uint8_t *)&m, sizeof(m)) == ESP_OK;
+  bool sent = false;
+  for (uint8_t i = 0; radioOk && i < SEND_COPIES; i++) {
+    if (i) delay(SEND_GAP_MS);
+    if (esp_now_send(BROADCAST_MAC, (const uint8_t *)&m, sizeof(m)) == ESP_OK) sent = true;
+  }
 
   if (linesPrinted % 20 == 0) printHeader();
   linesPrinted++;
