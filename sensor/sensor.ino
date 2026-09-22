@@ -25,7 +25,7 @@ const bool LONG_RANGE = true;
 
 // Zo vaak meten en versturen. Het display middelt alle metingen per LED.
 // Sneller dan ~1 s kan niet: één meting kost de AS7341 al ~0,6 s.
-const unsigned long INTERVAL_MS = 5000;
+const unsigned long INTERVAL_MS = 30000;
 
 // Elke meting een paar keer versturen. Een broadcast wordt niet bevestigd, dus
 // dit is de manier om afstand en een zwakke antenne op te vangen. Het display

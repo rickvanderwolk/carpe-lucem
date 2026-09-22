@@ -2,6 +2,8 @@
 // Ontvangt metingen van de sensormodule via ESP-NOW, middelt ze en zet elke
 // LED_INTERVAL_MS een nieuwe LED vooraan op de strip; de rest schuift een plek op.
 
+#include <SPI.h>
+#include <SD.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -9,6 +11,12 @@
 
 #define LED_PIN 6
 #define LED_COUNT 60
+
+// microSD-module (HW-125), gevoed met 5V van de ESP.
+#define SD_CS_PIN 10
+#define SD_MOSI_PIN 11
+#define SD_SCK_PIN 12
+#define SD_MISO_PIN 13
 
 // Moet gelijk zijn aan sensor/sensor.ino.
 #define ESPNOW_CHANNEL 1
@@ -24,7 +32,7 @@ const bool LONG_RANGE = true;
 //   60000UL * 60          ->  1 uur
 //   60000UL * 60 * 24     -> 24 uur
 //   60000UL * 60 * 24 * 7 ->  1 week
-const unsigned long TOTAL_TIME_MS = 60000UL * 15;
+const unsigned long TOTAL_TIME_MS = 60000UL * 60 * 24;
 
 const unsigned long LED_INTERVAL_MS = TOTAL_TIME_MS / LED_COUNT;
 
@@ -49,8 +57,20 @@ const uint8_t SATURATION_PCT = 80;
 // dat de geschiedenis opschuift.
 const bool DEBUG_PIXELS = false;
 
+// Twee logbestanden op de SD-kaart. RUW bevat elke meting, LEDS één regel per
+// LED. Bij het opstarten wordt de strip uit LEDS hersteld. Boven de grens
+// begint een bestand opnieuw, zodat de kaart niet volloopt.
+const char RAW_PATH[] = "/RUW.CSV";
+const char LED_PATH[] = "/LEDS.CSV";
+const char RAW_OLD_PATH[] = "/RUW.OUD";
+const char LED_OLD_PATH[] = "/LEDS.OUD";
+const char RAW_HEADER[] = "seq,ms,lux,gain,ch415,ch445,ch480,ch515,ch555,ch590,ch630,ch680,clear,nir";
+const char LED_HEADER[] = "seq,ms,metingen,lux,ch415,ch445,ch480,ch515,ch555,ch590,ch630,ch680,clear,nir";
+const uint32_t RAW_MAX_BYTES = 200000000UL;  // ~2 jaar bij een meting per 30 s
+const uint32_t LED_MAX_BYTES = 4000000UL;    // ~600 dagen bij 60 LEDs per dag
+
 // Na zoveel stilte een melding in de seriële monitor.
-const unsigned long SILENCE_WARN_MS = 15000;
+const unsigned long SILENCE_WARN_MS = 180000;
 
 // Moet gelijk zijn aan sensor/sensor.ino.
 const uint8_t PACKET_VERSION = 1;
@@ -96,6 +116,9 @@ Light latest;
 bool shownOnce = false;
 unsigned long lastShown = 0;
 
+bool sdActive = false;
+uint32_t ledSeq = 1;
+
 uint8_t clamp255(float v) {
   if (v < 0) return 0;
   if (v > 255) return 255;
@@ -134,6 +157,13 @@ void shiftHistory() {
   for (int i = LED_COUNT - 1; i > 0; i--) {
     strip.setPixelColor(i, strip.getPixelColor(i - 1));
   }
+}
+
+// Zet het licht als kleur vooraan op de strip en schuift de rest een plek op.
+void pushColor(const Light &l, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
+  computeColor(l, outR, outG, outB);
+  shiftHistory();
+  strip.setPixelColor(0, strip.Color(*outR, *outG, *outB));
 }
 
 void bootAnimation() {
@@ -193,6 +223,157 @@ const char *resetReason() {
   }
 }
 
+// ---- SD-kaart -------------------------------------------------------------
+
+// Zorgt dat een bestand bestaat met de juiste kop. Is het vol, dan schuift het
+// door naar het .OUD-bestand en begint een nieuw bestand, zodat je altijd de
+// laatste twee blokken hebt. Let op: op de ESP32 maakt FILE_WRITE een bestand
+// leeg, toevoegen gaat met FILE_APPEND.
+bool ensureFile(const char *path, const char *oldPath, const char *header, uint32_t maxBytes) {
+  bool fresh = !SD.exists(path);
+  if (!fresh) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    uint32_t size = f.size();
+    char head[5] = {0};
+    for (uint8_t i = 0; i < 4 && f.available(); i++) head[i] = (char)f.read();
+    f.close();
+
+    if (strncmp(head, "seq,", 4) != 0) {
+      SD.remove(path);            // onbruikbaar bestand
+      fresh = true;
+    } else if (size > maxBytes) {
+      SD.remove(oldPath);
+      SD.rename(path, oldPath);   // doorschuiven
+      Serial.printf("%s was vol en is %s geworden\n", path, oldPath);
+      fresh = true;
+    }
+  }
+  if (!fresh) return true;
+
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
+  f.println(header);
+  f.close();
+  return true;
+}
+
+void initSD() {
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, SPI)) {
+    Serial.println("geen SD-kaart gevonden, draait zonder log");
+    return;
+  }
+  sdActive = ensureFile(RAW_PATH, RAW_OLD_PATH, RAW_HEADER, RAW_MAX_BYTES) &&
+             ensureFile(LED_PATH, LED_OLD_PATH, LED_HEADER, LED_MAX_BYTES);
+  Serial.println(sdActive ? "SD OK" : "SD-kaart gevonden, maar schrijven lukt niet");
+  if (sdActive) {
+    File raw = SD.open(RAW_PATH, FILE_READ);
+    File led = SD.open(LED_PATH, FILE_READ);
+    Serial.printf("   %s %lu bytes, %s %lu bytes\n",
+                  RAW_PATH, (unsigned long)(raw ? raw.size() : 0),
+                  LED_PATH, (unsigned long)(led ? led.size() : 0));
+    if (raw) raw.close();
+    if (led) led.close();
+  }
+}
+
+void appendLine(const char *path, const char *line) {
+  if (!sdActive) return;
+  File f = SD.open(path, FILE_APPEND);
+  if (!f) {
+    Serial.println("schrijven naar SD mislukt");
+    return;
+  }
+  f.println(line);
+  f.close();
+}
+
+void logRaw(const Measurement &m) {
+  if (!sdActive) return;
+  char line[180];
+  int n = snprintf(line, sizeof(line), "%lu,%lu,%.2f,%u",
+                   (unsigned long)m.seq, (unsigned long)millis(), m.lux, m.gain);
+  for (uint8_t i = 0; i < 10 && n > 0 && n < (int)sizeof(line); i++) {
+    n += snprintf(line + n, sizeof(line) - n, ",%lu", (unsigned long)m.ch[i]);
+  }
+  appendLine(RAW_PATH, line);
+}
+
+void logLed(const Light &l, uint32_t samples) {
+  if (!sdActive) return;
+  char line[200];
+  int n = snprintf(line, sizeof(line), "%lu,%lu,%lu,%.2f", (unsigned long)ledSeq,
+                   (unsigned long)millis(), (unsigned long)samples, l.lux);
+  for (uint8_t i = 0; i < 10 && n > 0 && n < (int)sizeof(line); i++) {
+    n += snprintf(line + n, sizeof(line) - n, ",%.0f", l.ch[i]);
+  }
+  appendLine(LED_PATH, line);
+}
+
+// Leest één regel uit LEDS.CSV: seq,ms,metingen,lux en tien kanalen.
+bool parseLedLine(const char *line, Light *l) {
+  if (line[0] < '0' || line[0] > '9') return false;
+  const char *p = line;
+  float v[14];
+  uint8_t field = 0;
+  while (field < 14) {
+    v[field++] = atof(p);
+    while (*p && *p != ',') p++;
+    if (*p != ',') break;
+    p++;
+  }
+  if (field < 14) return false;
+  l->lux = v[3];
+  for (uint8_t i = 0; i < 10; i++) l->ch[i] = v[4 + i];
+  return true;
+}
+
+// Zet de laatste LED_COUNT regels uit de log terug op de strip, zodat een
+// herstart of een nieuwe upload je dag niet wist. De kleur wordt opnieuw
+// berekend, dus met andere instellingen ziet dezelfde dag er anders uit.
+void restoreFromLog() {
+  if (!sdActive) return;
+  File f = SD.open(LED_PATH, FILE_READ);
+  if (!f) return;
+
+  uint32_t size = f.size();
+  uint32_t window = (uint32_t)LED_COUNT * 160UL;
+  uint32_t start = size > window ? size - window : 0;
+  f.seek(start);
+  if (start > 0) {
+    while (f.available() && f.read() != '\n') {}   // halve regel overslaan
+  }
+
+  char buf[220];
+  uint16_t idx = 0;
+  uint16_t restored = 0;
+  while (f.available()) {
+    int c = f.read();
+    if (c == '\n' || c == '\r') {
+      buf[idx] = 0;
+      Light l;
+      if (idx > 10 && parseLedLine(buf, &l)) {
+        uint8_t r, g, b;
+        pushColor(l, &r, &g, &b);
+        ledSeq = strtoul(buf, NULL, 10) + 1;
+        restored++;
+      }
+      idx = 0;
+    } else if (idx < sizeof(buf) - 1) {
+      buf[idx++] = (char)c;
+    }
+  }
+  f.close();
+  strip.show();
+  if (restored) {
+    shownOnce = true;
+    lastShown = millis();
+  }
+  Serial.printf("hersteld uit de log: %u LED(s), volgende seq %lu\n",
+                restored, (unsigned long)ledSeq);
+}
+
 void collect(const Measurement &m) {
   if (receivedAny && m.seq == lastSeq) {
     statCopies++;   // kopie van een meting die we al hebben
@@ -211,6 +392,8 @@ void collect(const Measurement &m) {
   ledReceived++;
   lastSeq = m.seq;
 
+  logRaw(m);
+
   latest.lux = m.lux;
   sumLux += m.lux;
   for (uint8_t i = 0; i < 10; i++) {
@@ -228,10 +411,10 @@ void showNextLed() {
   }
 
   uint8_t r, g, b;
-  computeColor(l, &r, &g, &b);
-  shiftHistory();
-  strip.setPixelColor(0, strip.Color(r, g, b));
+  pushColor(l, &r, &g, &b);
   strip.show();
+  logLed(l, sampleCount);
+  ledSeq++;
 
   uint32_t ledTotal = ledReceived + ledMissed;
   uint32_t total = statReceived + statMissed;
@@ -267,6 +450,9 @@ void setup() {
   strip.begin();
   strip.show();
   bootAnimation();
+
+  initSD();
+  restoreFromLog();
 
   initRadio();
   Serial.printf("opgestart door: %s (%d)\n", resetReason(), esp_reset_reason());
