@@ -47,11 +47,34 @@ const bool AVERAGE = true;
 enum BrightnessMode { BRIGHT_LOG, BRIGHT_POWER, BRIGHT_LINEAR };
 const BrightnessMode BRIGHTNESS_MODE = BRIGHT_LOG;
 
-const float LUX_MIN = 1.0;        // hieronder blijft de LED uit
+// Volumeknop voor de hele strip: 1.0 is vol, 0.5 is halve sterkte. Alle LEDs
+// worden even veel zachter, dus de onderlinge verschillen blijven hetzelfde.
+const float MAX_BRIGHTNESS = 1.0;
+
+const float LUX_MIN = 0.2;       // hieronder blijft de LED uit
 const float LUX_MAX = 50000.0;    // hierboven staat hij vol
 const float POWER_GAMMA = 2.5;    // alleen voor BRIGHT_POWER
 
-const uint8_t SATURATION_PCT = 80;
+// IJking van de sensor, gemeten aan een hele dag daglicht uit de eigen log:
+// daglicht komt er binnen in de verhouding rood 2,46 : groen 1,56 : blauw 1,
+// doordat silicium veel gevoeliger is voor rood dan voor blauw. Door daarvoor
+// terug te rekenen is gemiddeld daglicht wit, en blijft licht dat echt warmer
+// of koeler is dat ook. Verhuist de sensor naar een andere plek, dan hoort
+// deze ijking opnieuw uit de log bepaald te worden.
+const float WB_R = 0.41;
+const float WB_G = 0.64;
+const float WB_B = 1.00;
+
+// IJking van de ledstrip zelf. Gelijke waarden voor rood, groen en blauw zien
+// er koelwit uit, want de blauwe LED is relatief sterk. Met deze factoren ziet
+// neutraal licht er ook neutraal uit. Stel ze gerust bij op het oog.
+const float STRIP_R = 1.00;
+const float STRIP_G = 0.92;
+const float STRIP_B = 0.78;
+
+// Hoe ver kleurverschillen worden uitvergroot. Lager is subtieler, 0 geeft
+// precies de gemeten verhoudingen.
+const uint8_t SATURATION_PCT = 90;
 
 // Print bij elke nieuwe LED de eerste acht LEDs van de strip, om te controleren
 // dat de geschiedenis opschuift.
@@ -136,9 +159,9 @@ float brightnessFor(float lux) {
 
 // Kleur uit de verhouding tussen de kanalen, helderheid uit lux.
 void computeColor(const Light &m, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
-  float rawR = m.ch[6] + m.ch[7] + m.ch[5] / 2.0f;   // 630 + 680 + ½ 590
-  float rawG = m.ch[3] + m.ch[4];                    // 515 + 555
-  float rawB = m.ch[1] + m.ch[2] + m.ch[0] / 2.0f;   // 445 + 480 + ½ 415
+  float rawR = (m.ch[6] + m.ch[7] + m.ch[5] / 2.0f) * WB_R;   // 630 + 680 + ½ 590
+  float rawG = (m.ch[3] + m.ch[4]) * WB_G;                    // 515 + 555
+  float rawB = (m.ch[1] + m.ch[2] + m.ch[0] / 2.0f) * WB_B;   // 445 + 480 + ½ 415
 
   float minRGB = min(rawR, min(rawG, rawB));
   float maxRGB = max(rawR, max(rawG, rawB));
@@ -147,10 +170,10 @@ void computeColor(const Light &m, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
   float range = maxRGB - stretchMin;
   if (range <= 0) range = 1;
 
-  float brightness = brightnessFor(m.lux);
-  *outR = clamp255((rawR - stretchMin) * 255.0f / range * brightness);
-  *outG = clamp255((rawG - stretchMin) * 255.0f / range * brightness);
-  *outB = clamp255((rawB - stretchMin) * 255.0f / range * brightness);
+  float brightness = brightnessFor(m.lux) * MAX_BRIGHTNESS;
+  *outR = clamp255((rawR - stretchMin) * 255.0f / range * brightness * STRIP_R);
+  *outG = clamp255((rawG - stretchMin) * 255.0f / range * brightness * STRIP_G);
+  *outB = clamp255((rawB - stretchMin) * 255.0f / range * brightness * STRIP_B);
 }
 
 void shiftHistory() {
@@ -260,7 +283,18 @@ bool ensureFile(const char *path, const char *oldPath, const char *header, uint3
 
 void initSD() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, SPI)) {
+
+  // Een paar pogingen: de module heeft soms even nodig, en een wat slapper
+  // contact lukt bij de tweede poging vaak wel.
+  bool mounted = false;
+  for (uint8_t attempt = 1; attempt <= 4 && !mounted; attempt++) {
+    mounted = SD.begin(SD_CS_PIN, SPI);
+    if (!mounted) {
+      SD.end();
+      delay(250);
+    }
+  }
+  if (!mounted) {
     Serial.println("geen SD-kaart gevonden, draait zonder log");
     return;
   }
