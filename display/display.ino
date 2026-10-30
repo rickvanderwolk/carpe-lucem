@@ -119,6 +119,10 @@ const uint32_t LED_MAX_BYTES = 4000000UL;    // ~600 dagen bij 60 LEDs per dag
 // Na zoveel stilte een melding in de seriële monitor.
 const unsigned long SILENCE_WARN_MS = 180000;
 
+// De strip kan los van de ESP uit en aan; zo krijgt hij binnen deze tijd zijn
+// stand terug, in plaats van pas bij de volgende LED.
+const unsigned long REFRESH_MS = 1000;
+
 // Moet gelijk zijn aan sensor/sensor.ino.
 const uint8_t PACKET_VERSION = 1;
 struct __attribute__((packed)) Measurement {
@@ -162,6 +166,7 @@ Light latest;
 
 bool shownOnce = false;
 unsigned long lastShown = 0;
+unsigned long lastRefresh = 0;
 
 bool sdActive = false;
 uint32_t ledSeq = 1;
@@ -634,6 +639,11 @@ void loop() {
     } else {
       Serial.println("geen metingen in dit interval, LED overgeslagen");
     }
+  }
+
+  if (millis() - lastRefresh >= REFRESH_MS) {
+    lastRefresh = millis();
+    strip.show();
   }
 
   if (millis() - lastReceived > SILENCE_WARN_MS && millis() - lastWarned > SILENCE_WARN_MS) {
