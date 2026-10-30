@@ -55,15 +55,15 @@ const float LUX_MIN = 0.2;       // hieronder blijft de LED uit
 const float LUX_MAX = 50000.0;    // hierboven staat hij vol
 const float POWER_GAMMA = 2.5;    // alleen voor BRIGHT_POWER
 
-// IJking van de sensor, gemeten aan een hele dag daglicht uit de eigen log:
-// daglicht komt er binnen in de verhouding rood 2,46 : groen 1,56 : blauw 1,
-// doordat silicium veel gevoeliger is voor rood dan voor blauw. Door daarvoor
-// terug te rekenen is gemiddeld daglicht wit, en blijft licht dat echt warmer
-// of koeler is dat ook. Verhuist de sensor naar een andere plek, dan hoort
-// deze ijking opnieuw uit de log bepaald te worden.
-const float WB_R = 0.41;
-const float WB_G = 0.64;
-const float WB_B = 1.00;
+// De acht kanalen van de AS7341 volgens de datasheet (DS000504 v3-00):
+// middengolflengte en breedte (FWHM) uit de optische tabellen, en de
+// gevoeligheid ten opzichte van F8 uit figuur 19. Silicium is veel gevoeliger
+// voor rood dan voor blauw; door elk kanaal door zijn eigen gevoeligheid en
+// breedte te delen houd je het lichtspectrum zelf over. Dat is een
+// eigenschap van de sensor, niet van de plek, dus er valt niets bij te ijken.
+const float CH_NM[8]   = {415, 445, 480, 515, 555, 590, 630, 680};
+const float CH_FWHM[8] = { 26,  30,  36,  39,  39,  40,  50,  52};
+const float CH_RESP[8] = {0.17, 0.30, 0.38, 0.49, 0.57, 0.65, 0.76, 1.00};
 
 // IJking van de ledstrip zelf. Gelijke waarden voor rood, groen en blauw zien
 // er koelwit uit, want de blauwe LED is relatief sterk. Met deze factoren ziet
@@ -72,9 +72,33 @@ const float STRIP_R = 1.00;
 const float STRIP_G = 0.92;
 const float STRIP_B = 0.78;
 
-// Hoe ver kleurverschillen worden uitvergroot. Lager is subtieler, 0 geeft
-// precies de gemeten verhoudingen.
-const uint8_t SATURATION_PCT = 90;
+// Hoe de kleur van een LED wordt bepaald.
+//   COLOUR_RAW    : de kanalen zoals de chip ze ziet, zoals de eerste versie.
+//                   Warm en amber, maar dat komt door het silicium: ook grijs
+//                   daglicht wordt amber.
+//   COLOUR_TRUE   : de kleur zoals je oog hem ziet, uit de datasheet via CIE.
+//   COLOUR_KELVIN : de gemeten kleurtemperatuur op een vast vuurpalet. Echt
+//                   gemeten, maar getoond als legenda in plaats van als kleur.
+enum ColourMode { COLOUR_RAW, COLOUR_TRUE, COLOUR_KELVIN };
+const ColourMode COLOUR_MODE = COLOUR_RAW;
+
+// Hoe ver kleurverschillen worden uitvergroot, per modus. 0 geeft precies de
+// gemeten verhoudingen. COLOUR_KELVIN rekt niet op, het palet is de kleur.
+const uint8_t RAW_SATURATION_PCT = 80;
+const uint8_t TRUE_SATURATION_PCT = 0;
+
+// Voor COLOUR_KELVIN: deze kleurtemperatuur krijgt de warmste kleur van het
+// palet, en deze de koelste. Daartussen in mired (1e6 / K), want gelijke
+// stappen daarin zien eruit als gelijke kleurverschuivingen.
+const float KELVIN_WARM = 2200;
+const float KELVIN_COOL = 12000;
+
+// Het palet van koel (0) naar warm (1), als in de preview "Vuur".
+const uint8_t PALETTE_STOPS = 4;
+const float PALETTE_POS[PALETTE_STOPS] = {0, 0.35, 0.7, 1};
+const uint8_t PALETTE_RGB[PALETTE_STOPS][3] = {
+  {255, 236, 205}, {255, 192, 96}, {255, 118, 22}, {214, 38, 0}
+};
 
 // Print bij elke nieuwe LED de eerste acht LEDs van de strip, om te controleren
 // dat de geschiedenis opschuift.
@@ -157,16 +181,116 @@ float brightnessFor(float lux) {
   return logf(lux / LUX_MIN) / logf(LUX_MAX / LUX_MIN);
 }
 
-// Kleur uit de verhouding tussen de kanalen, helderheid uit lux.
+// Van kanalen naar CIE XYZ en naar lineair sRGB, eenmalig berekend in
+// buildColorMatrix().
+float chToXyz[3][8];
+float chToRgb[3][8];
+
+// Asymmetrische gauss, voor de benadering van de CIE-kleurfuncties.
+float lobe(float nm, float mu, float sLow, float sHigh) {
+  float t = (nm - mu) / (nm < mu ? sLow : sHigh);
+  return expf(-0.5f * t * t);
+}
+
+// CIE 1931 2°-kleurfuncties, benaderd volgens Wyman, Sloan en Shirley (2013).
+void cieXYZ(float nm, float *x, float *y, float *z) {
+  *x = 1.056f * lobe(nm, 599.8f, 37.9f, 31.0f) + 0.362f * lobe(nm, 442.0f, 16.0f, 26.7f)
+     - 0.065f * lobe(nm, 501.1f, 20.4f, 26.2f);
+  *y = 0.821f * lobe(nm, 568.8f, 46.9f, 40.5f) + 0.286f * lobe(nm, 530.9f, 16.3f, 31.1f);
+  *z = 1.217f * lobe(nm, 437.0f, 11.8f, 36.0f) + 0.681f * lobe(nm, 459.0f, 26.0f, 13.8f);
+}
+
+// Per kanaal het lichtspectrum op zijn golflengte; daartussen lineair
+// geïnterpoleerd, daarbuiten vlak doorgetrokken. Gewogen met de kleurfuncties
+// geeft dat XYZ, en daaruit sRGB met D65 als wit. Alles is lineair in de
+// kanalen, dus het past in één matrix.
+void buildColorMatrix() {
+  for (int nm = 380; nm <= 780; nm += 5) {
+    float w[8] = {0};
+    if (nm <= CH_NM[0]) {
+      w[0] = 1;
+    } else if (nm >= CH_NM[7]) {
+      w[7] = 1;
+    } else {
+      for (uint8_t i = 0; i < 7; i++) {
+        if (nm <= CH_NM[i + 1]) {
+          float t = (nm - CH_NM[i]) / (CH_NM[i + 1] - CH_NM[i]);
+          w[i] = 1 - t;
+          w[i + 1] = t;
+          break;
+        }
+      }
+    }
+    float x, y, z;
+    cieXYZ(nm, &x, &y, &z);
+    for (uint8_t i = 0; i < 8; i++) {
+      float e = w[i] / (CH_RESP[i] * CH_FWHM[i]);
+      chToXyz[0][i] += e * x;
+      chToXyz[1][i] += e * y;
+      chToXyz[2][i] += e * z;
+    }
+  }
+  const float xyzToRgb[3][3] = {{ 3.2406f, -1.5372f, -0.4986f},
+                                {-0.9689f,  1.8758f,  0.0415f},
+                                { 0.0557f, -0.2040f,  1.0570f}};
+  for (uint8_t c = 0; c < 3; c++) {
+    for (uint8_t i = 0; i < 8; i++) {
+      chToRgb[c][i] = xyzToRgb[c][0] * chToXyz[0][i] + xyzToRgb[c][1] * chToXyz[1][i] +
+                      xyzToRgb[c][2] * chToXyz[2][i];
+    }
+  }
+}
+
+// Gecorreleerde kleurtemperatuur uit XYZ, volgens McCamy (1992).
+float kelvinFor(const Light &m) {
+  float xyz[3] = {0, 0, 0};
+  for (uint8_t c = 0; c < 3; c++) {
+    for (uint8_t i = 0; i < 8; i++) xyz[c] += chToXyz[c][i] * m.ch[i];
+  }
+  float sum = xyz[0] + xyz[1] + xyz[2];
+  if (sum <= 0) return KELVIN_WARM;
+  float x = xyz[0] / sum, y = xyz[1] / sum;
+  if (y >= 0.1858f) y = 0.1857f;
+  float n = (x - 0.3320f) / (0.1858f - y);
+  return 449 * n * n * n + 3525 * n * n + 6823.3f * n + 5520.33f;
+}
+
+void paletteFor(float kelvin, float *rgb) {
+  float t = (1e6f / kelvin - 1e6f / KELVIN_COOL) / (1e6f / KELVIN_WARM - 1e6f / KELVIN_COOL);
+  t = constrain(t, 0.0f, 1.0f);
+  uint8_t i = 0;
+  while (i < PALETTE_STOPS - 2 && t > PALETTE_POS[i + 1]) i++;
+  float u = (t - PALETTE_POS[i]) / (PALETTE_POS[i + 1] - PALETTE_POS[i]);
+  for (uint8_t c = 0; c < 3; c++) {
+    rgb[c] = PALETTE_RGB[i][c] + (PALETTE_RGB[i + 1][c] - PALETTE_RGB[i][c]) * u;
+  }
+}
+
+// Kleur volgens COLOUR_MODE, helderheid uit lux.
 void computeColor(const Light &m, uint8_t *outR, uint8_t *outG, uint8_t *outB) {
-  float rawR = (m.ch[6] + m.ch[7] + m.ch[5] / 2.0f) * WB_R;   // 630 + 680 + ½ 590
-  float rawG = (m.ch[3] + m.ch[4]) * WB_G;                    // 515 + 555
-  float rawB = (m.ch[1] + m.ch[2] + m.ch[0] / 2.0f) * WB_B;   // 445 + 480 + ½ 415
+  float rgb[3];
+  uint8_t saturation = 0;
+  if (COLOUR_MODE == COLOUR_RAW) {
+    rgb[0] = m.ch[6] + m.ch[7] + m.ch[5] / 2.0f;   // 630 + 680 + ½ 590
+    rgb[1] = m.ch[3] + m.ch[4];                    // 515 + 555
+    rgb[2] = m.ch[1] + m.ch[2] + m.ch[0] / 2.0f;   // 445 + 480 + ½ 415
+    saturation = RAW_SATURATION_PCT;
+  } else if (COLOUR_MODE == COLOUR_TRUE) {
+    for (uint8_t c = 0; c < 3; c++) {
+      rgb[c] = 0;
+      for (uint8_t i = 0; i < 8; i++) rgb[c] += chToRgb[c][i] * m.ch[i];
+      if (rgb[c] < 0) rgb[c] = 0;   // buiten wat de strip kan tonen
+    }
+    saturation = TRUE_SATURATION_PCT;
+  } else {
+    paletteFor(kelvinFor(m), rgb);
+  }
+  float rawR = rgb[0], rawG = rgb[1], rawB = rgb[2];
 
   float minRGB = min(rawR, min(rawG, rawB));
   float maxRGB = max(rawR, max(rawG, rawB));
 
-  float stretchMin = minRGB * SATURATION_PCT / 100.0f;
+  float stretchMin = minRGB * saturation / 100.0f;
   float range = maxRGB - stretchMin;
   if (range <= 0) range = 1;
 
@@ -486,6 +610,7 @@ void setup() {
   bootAnimation();
 
   initSD();
+  buildColorMatrix();
   restoreFromLog();
 
   initRadio();
